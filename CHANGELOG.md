@@ -4,12 +4,13 @@
 
 ### Added
 
-- `execute_query_batch` accepts a `session_id` and keeps that session's
-  connection when the batch leaves an explicit transaction open, so `BEGIN`,
-  the changes, a verifying `SELECT` and `COMMIT` can each be their own run
-  instead of having to be one script. When `session_id` is given the reply
-  carries `{ results, in_transaction }`; without one it stays the bare array,
-  so older hosts are unaffected.
+- `execute_query` and `execute_query_batch` accept a `session_id` and keep
+  that session's connection when the statement or batch leaves an explicit
+  transaction open, so `BEGIN`, the changes, a verifying `SELECT` and
+  `COMMIT` can each be their own run instead of having to be one script.
+  With a `session_id` the replies carry `{ result, in_transaction }` and
+  `{ results, in_transaction }`; without one they stay the bare
+  `QueryResult` and array, so older hosts are unaffected.
 - `release_session` RPC method, called when the owning editor tab closes.
 
 ### Fixed

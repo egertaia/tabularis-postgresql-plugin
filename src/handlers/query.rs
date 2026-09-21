@@ -19,6 +19,33 @@ pub async fn execute_query(id: Value, params: &Value) -> Value {
         .map(|v| v as u32);
     let page = params.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
     let schema = params.get("schema").and_then(Value::as_str);
+    let session_id = params.get("session_id").and_then(Value::as_str);
+
+    // One statement at a time is how a transaction is actually driven -
+    // BEGIN, the changes, a verifying SELECT, COMMIT - so this path needs
+    // the same pinning as a batch. Implemented as a one-statement batch so
+    // there is a single session code path.
+    if session_id.is_some() {
+        let queries = [query.to_string()];
+        return match run_batch_in_session(&conn_params, &queries, limit, page, schema, session_id)
+            .await
+        {
+            Ok((mut results, in_transaction)) => {
+                let statement = results.pop().unwrap_or(Value::Null);
+                match statement.get("error").and_then(Value::as_str) {
+                    Some(error) => error_response(id, -32603, error),
+                    None => {
+                        let result = statement.get("result").cloned().unwrap_or(Value::Null);
+                        ok_response(
+                            id,
+                            json!({ "result": result, "in_transaction": in_transaction }),
+                        )
+                    }
+                }
+            }
+            Err(e) => error_response(id, -32603, &e),
+        };
+    }
 
     match exec_query(&conn_params, query, limit, page, schema).await {
         Ok(result) => ok_response(id, result),
@@ -48,7 +75,39 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     // same tab continues that transaction.
     let session_id = params.get("session_id").and_then(Value::as_str);
 
-    // Reuse the session's pinned connection when it left a transaction open.
+    match run_batch_in_session(&conn_params, &queries, limit, page, schema, session_id).await {
+        // Only a session-aware call gets the richer shape; a host that did
+        // not send a session_id still receives the bare array it expects.
+        Ok((results, in_transaction)) => match session_id {
+            Some(_) => ok_response(
+                id,
+                json!({ "results": results, "in_transaction": in_transaction }),
+            ),
+            None => ok_response(id, json!(results)),
+        },
+        Err(e) => error_response(id, -32603, &e),
+    }
+}
+
+/// Run `queries` on one connection, reusing the session's pinned one when
+/// it left a transaction open and re-pinning it if one is still open after.
+///
+/// Returns one per-statement result object per query — the same shape
+/// `execute_query_batch` replies with — plus whether the session is still
+/// inside a transaction. Shared with `execute_query` so a single statement
+/// and a batch take the same session path.
+///
+/// A batch that leaves a transaction open with no session to pin it to is
+/// rolled back: the pool recycles with `RecyclingMethod::Fast`, so the next
+/// borrower would otherwise inherit the transaction and its locks.
+async fn run_batch_in_session(
+    conn_params: &ConnectionParams,
+    queries: &[String],
+    limit: Option<u32>,
+    page: u32,
+    schema: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(Vec<Value>, bool), String> {
     let pinned = match session_id {
         Some(sid) => session::take(sid).await,
         None => None,
@@ -61,20 +120,10 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     let pg_client = match pinned {
         Some(client) => client,
         None => {
-            let pool = match client::build_pool_pub(&conn_params).await {
-                Ok(p) => p,
-                Err(e) => return error_response(id, -32603, &e),
-            };
-            match pool.get().await {
-                Ok(c) => c,
-                Err(e) => {
-                    return error_response(
-                        id,
-                        -32603,
-                        &format!("Connection failed: {}", client::format_pool_error(&e)),
-                    )
-                }
-            }
+            let pool = client::build_pool_pub(conn_params).await?;
+            pool.get()
+                .await
+                .map_err(|e| format!("Connection failed: {}", client::format_pool_error(&e)))?
         }
     };
 
@@ -83,17 +132,16 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
     if let Some(s) = schema.filter(|_| !reused) {
         let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
         if let Err(e) = pg_client.batch_execute(&set_path).await {
-            return error_response(
-                id,
-                -32603,
-                &format!("Failed to set search_path: {}", client::format_pg_error(&e)),
-            );
+            return Err(format!(
+                "Failed to set search_path: {}",
+                client::format_pg_error(&e)
+            ));
         }
     }
 
     let mut results: Vec<Value> = Vec::new();
 
-    for query in &queries {
+    for query in queries {
         let start = Instant::now();
         let outcome = exec_query_on_client(&pg_client, query, limit, page).await;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -127,22 +175,12 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
         Some(sid) if in_transaction => session::store(sid, pg_client).await,
         _ => {
             if in_transaction {
-                // Nothing to pin the connection to, and the pool recycles
-                // without resetting, so it must not go back mid-transaction.
                 session::rollback_and_release(pg_client).await;
             }
         }
     }
 
-    match session_id {
-        // Only a session-aware call gets the richer shape; a host that did
-        // not send a session_id still receives the bare array it expects.
-        Some(_) => ok_response(
-            id,
-            json!({ "results": results, "in_transaction": in_transaction }),
-        ),
-        None => ok_response(id, json!(results)),
-    }
+    Ok((results, in_transaction))
 }
 
 /// Roll back and release the connection pinned to a session. Called when
