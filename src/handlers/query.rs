@@ -8,6 +8,7 @@ use crate::client;
 use crate::extract::extract_value;
 use crate::models::{inner_params, ConnectionParams};
 use crate::rpc::{error_response, ok_response};
+use crate::session;
 
 pub async fn execute_query(id: Value, params: &Value) -> Value {
     let conn_params = ConnectionParams::from_value(inner_params(params));
@@ -42,24 +43,44 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
         .map(|v| v as u32);
     let page = params.get("page").and_then(Value::as_u64).unwrap_or(1) as u32;
     let schema = params.get("schema").and_then(Value::as_str);
+    // The host sends the editor tab's id. A batch that leaves a transaction
+    // open keeps its connection under this key so the next batch from the
+    // same tab continues that transaction.
+    let session_id = params.get("session_id").and_then(Value::as_str);
+
+    // Reuse the session's pinned connection when it left a transaction open.
+    let pinned = match session_id {
+        Some(sid) => session::take(sid).await,
+        None => None,
+    };
+    // A pinned connection only exists because its transaction is still open.
+    let mut in_transaction = pinned.is_some();
+    let reused = pinned.is_some();
 
     // Acquire ONE connection for the entire batch (session state must survive)
-    let pool = match client::build_pool_pub(&conn_params).await {
-        Ok(p) => p,
-        Err(e) => return error_response(id, -32603, &e),
-    };
-    let pg_client = match pool.get().await {
-        Ok(c) => c,
-        Err(e) => {
-            return error_response(
-                id,
-                -32603,
-                &format!("Connection failed: {}", client::format_pool_error(&e)),
-            )
+    let pg_client = match pinned {
+        Some(client) => client,
+        None => {
+            let pool = match client::build_pool_pub(&conn_params).await {
+                Ok(p) => p,
+                Err(e) => return error_response(id, -32603, &e),
+            };
+            match pool.get().await {
+                Ok(c) => c,
+                Err(e) => {
+                    return error_response(
+                        id,
+                        -32603,
+                        &format!("Connection failed: {}", client::format_pool_error(&e)),
+                    )
+                }
+            }
         }
     };
 
-    if let Some(s) = schema {
+    // Applying it to a reused connection would run inside the open
+    // transaction and change what the rest of it sees.
+    if let Some(s) = schema.filter(|_| !reused) {
         let set_path = format!("SET search_path TO \"{}\"", s.replace('"', "\"\""));
         if let Err(e) = pg_client.batch_execute(&set_path).await {
             return error_response(
@@ -77,6 +98,17 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
         let outcome = exec_query_on_client(&pg_client, query, limit, page).await;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+        // A failed statement changes nothing: a failed COMMIT leaves the
+        // transaction open (aborted), and the session stays pinned so the
+        // user can still ROLLBACK from the same tab.
+        if outcome.is_ok() {
+            match transaction_effect(query) {
+                TransactionEffect::Opens => in_transaction = true,
+                TransactionEffect::Closes => in_transaction = false,
+                TransactionEffect::None => {}
+            }
+        }
+
         match outcome {
             Ok(result) => results.push(json!({
                 "result": result,
@@ -91,7 +123,38 @@ pub async fn execute_query_batch(id: Value, params: &Value) -> Value {
         }
     }
 
-    ok_response(id, json!(results))
+    match session_id {
+        Some(sid) if in_transaction => session::store(sid, pg_client).await,
+        _ => {
+            if in_transaction {
+                // Nothing to pin the connection to, and the pool recycles
+                // without resetting, so it must not go back mid-transaction.
+                session::rollback_and_release(pg_client).await;
+            }
+        }
+    }
+
+    match session_id {
+        // Only a session-aware call gets the richer shape; a host that did
+        // not send a session_id still receives the bare array it expects.
+        Some(_) => ok_response(
+            id,
+            json!({ "results": results, "in_transaction": in_transaction }),
+        ),
+        None => ok_response(id, json!(results)),
+    }
+}
+
+/// Roll back and release the connection pinned to a session. Called when
+/// the owning editor tab closes.
+pub async fn release_session(id: Value, params: &Value) -> Value {
+    match params.get("session_id").and_then(Value::as_str) {
+        Some(session_id) => {
+            session::release(session_id).await;
+            ok_response(id, json!({ "released": true }))
+        }
+        None => error_response(id, -32602, "session_id is required"),
+    }
 }
 
 pub async fn explain_query(id: Value, params: &Value) -> Value {
@@ -295,6 +358,53 @@ async fn exec_query_on_client(
         "truncated": truncated,
         "pagination": pagination,
     }))
+}
+
+/// What a statement does to the surrounding transaction.
+///
+/// Decides whether the connection a batch ran on must be kept for the next
+/// batch of the same session (an explicit transaction is still open) or may
+/// go back to the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionEffect {
+    /// Opens an explicit transaction (`BEGIN`, `START TRANSACTION`).
+    Opens,
+    /// Closes the current transaction (`COMMIT`, `ROLLBACK`, `END`).
+    ///
+    /// `ROLLBACK TO SAVEPOINT` does not close it and is classified as
+    /// [`TransactionEffect::None`].
+    Closes,
+    /// Leaves the transaction state as it was.
+    None,
+}
+
+/// Classify a statement's effect on the transaction state.
+///
+/// Only the leading keywords are inspected, so a `BEGIN` inside a string
+/// literal or a later clause cannot be mistaken for transaction control. A
+/// PL/pgSQL `BEGIN … END` body is not a concern: it arrives inside a `DO`
+/// or `CREATE FUNCTION` statement, whose leading keyword is neither.
+pub fn transaction_effect(query: &str) -> TransactionEffect {
+    let normalized = strip_leading_sql_comments(query);
+    let mut words = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_uppercase());
+
+    let Some(first) = words.next() else {
+        return TransactionEffect::None;
+    };
+    let second = words.next();
+
+    match first.as_str() {
+        "BEGIN" => TransactionEffect::Opens,
+        "START" if second.as_deref() == Some("TRANSACTION") => TransactionEffect::Opens,
+        "COMMIT" => TransactionEffect::Closes,
+        "ROLLBACK" if second.as_deref() == Some("TO") => TransactionEffect::None,
+        "ROLLBACK" => TransactionEffect::Closes,
+        "END" => TransactionEffect::Closes,
+        _ => TransactionEffect::None,
+    }
 }
 
 /// Strip leading SQL comments (`-- …` line comments and `/* … */` block

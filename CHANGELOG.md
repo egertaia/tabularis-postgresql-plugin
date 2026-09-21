@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `execute_query_batch` accepts a `session_id` and keeps that session's
+  connection when the batch leaves an explicit transaction open, so `BEGIN`,
+  the changes, a verifying `SELECT` and `COMMIT` can each be their own run
+  instead of having to be one script. When `session_id` is given the reply
+  carries `{ results, in_transaction }`; without one it stays the bare array,
+  so older hosts are unaffected.
+- `release_session` RPC method, called when the owning editor tab closes.
+
+### Fixed
+
+- A batch that left a transaction open returned its connection to the pool
+  as-is. The pool recycles with `RecyclingMethod::Fast`, which resets
+  nothing, so the next borrower inherited the open transaction and its
+  locks. A connection is now always rolled back before it goes back.
+
 ## [1.0.0-rc.4] - 2026-09-17
 
 ### Added

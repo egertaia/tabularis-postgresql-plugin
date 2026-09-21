@@ -12,7 +12,7 @@
 
 use super::{
     raw_explain_output, returns_result_set, strip_leading_sql_comments,
-    supports_trailing_limit_clause,
+    supports_trailing_limit_clause, transaction_effect, TransactionEffect,
 };
 
 #[test]
@@ -188,5 +188,99 @@ fn raw_explain_output_payload_is_not_the_live_json_value() {
     assert!(
         payload_value.is_string(),
         "payload must be Value::String, got {payload_value:?}"
+    );
+}
+
+#[test]
+fn transaction_effect_detects_opening_statements() {
+    for query in [
+        "BEGIN",
+        "begin;",
+        "BEGIN TRANSACTION",
+        "BEGIN ISOLATION LEVEL SERIALIZABLE",
+        "START TRANSACTION",
+        "start transaction read write",
+    ] {
+        assert_eq!(
+            transaction_effect(query),
+            TransactionEffect::Opens,
+            "{query} should open a transaction"
+        );
+    }
+}
+
+#[test]
+fn transaction_effect_detects_closing_statements() {
+    for query in ["COMMIT", "commit;", "ROLLBACK", "END", "END TRANSACTION"] {
+        assert_eq!(
+            transaction_effect(query),
+            TransactionEffect::Closes,
+            "{query} should close the transaction"
+        );
+    }
+}
+
+#[test]
+fn transaction_effect_ignores_savepoint_rollback() {
+    // Unwinding to a savepoint leaves the transaction open, so the
+    // connection must stay pinned to the session.
+    assert_eq!(
+        transaction_effect("ROLLBACK TO SAVEPOINT before_update"),
+        TransactionEffect::None
+    );
+    assert_eq!(
+        transaction_effect("ROLLBACK TO before_update"),
+        TransactionEffect::None
+    );
+}
+
+#[test]
+fn transaction_effect_ignores_ordinary_statements() {
+    for query in [
+        "SELECT 1",
+        "UPDATE t SET a = 1",
+        "SAVEPOINT before_update",
+        // `BEGIN` appearing as data, not as the leading keyword.
+        "SELECT 'BEGIN' AS word",
+        "INSERT INTO log (msg) VALUES ('COMMIT')",
+    ] {
+        assert_eq!(
+            transaction_effect(query),
+            TransactionEffect::None,
+            "{query} should not change the transaction state"
+        );
+    }
+}
+
+#[test]
+fn transaction_effect_sees_through_leading_comments() {
+    assert_eq!(
+        transaction_effect("-- start the transaction\nBEGIN"),
+        TransactionEffect::Opens
+    );
+    assert_eq!(
+        transaction_effect("/* done */ COMMIT"),
+        TransactionEffect::Closes
+    );
+}
+
+#[test]
+fn transaction_effect_handles_empty_input() {
+    assert_eq!(transaction_effect(""), TransactionEffect::None);
+    assert_eq!(transaction_effect("   \n"), TransactionEffect::None);
+    assert_eq!(
+        transaction_effect("-- only a comment"),
+        TransactionEffect::None
+    );
+}
+
+#[test]
+fn transaction_effect_does_not_match_plpgsql_block_bodies() {
+    // A PL/pgSQL `BEGIN … END` arrives inside a DO or CREATE FUNCTION
+    // statement, whose leading keyword is neither, so the block body cannot
+    // be mistaken for transaction control.
+    assert_eq!(
+        transaction_effect("DO $$ BEGIN RAISE NOTICE 'hi'; END $$"),
+        TransactionEffect::None
     );
 }
