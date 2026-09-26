@@ -31,8 +31,8 @@ struct PinnedSession {
 
 /// A pinned connection holds its transaction's locks until the session ends
 /// it. An abandoned session would hold them indefinitely, so one untouched
-/// for this long is rolled back and released the next time any session is
-/// looked up.
+/// for this long is rolled back and released by the periodic
+/// [`sweep_idle`].
 const MAX_IDLE: Duration = Duration::from_secs(30 * 60);
 
 type SessionMap = HashMap<String, PinnedSession>;
@@ -52,40 +52,41 @@ pub async fn rollback_and_release(client: Client) {
     }
 }
 
-/// Take the connection pinned to `session_id`, if any, and sweep sessions
-/// idle past [`MAX_IDLE`].
+/// Take the connection pinned to `session_id`, if any.
 ///
 /// The caller owns the returned client and must either hand it back via
 /// [`store`] or end the transaction itself.
 pub async fn take(session_id: &str) -> Option<Client> {
-    let (taken, expired) = {
+    sessions().lock().await.remove(session_id).map(|s| s.client)
+}
+
+/// Roll back and release every session idle past [`MAX_IDLE`].
+pub async fn sweep_idle() {
+    let expired: Vec<Client> = {
         let mut map = sessions().lock().await;
-        let taken = map.remove(session_id).map(|s| s.client);
         let now = Instant::now();
         let stale: Vec<String> = map
             .iter()
             .filter(|(_, s)| now.duration_since(s.last_used) > MAX_IDLE)
             .map(|(id, _)| id.clone())
             .collect();
-        let expired: Vec<Client> = stale
+        stale
             .iter()
             .filter_map(|id| map.remove(id).map(|s| s.client))
-            .collect();
-        if !stale.is_empty() {
-            log::info!(
-                "Releasing {} pinned session(s) idle for over {} minutes",
-                stale.len(),
-                MAX_IDLE.as_secs() / 60
-            );
-        }
-        (taken, expired)
+            .collect()
     };
 
+    if expired.is_empty() {
+        return;
+    }
+    log::info!(
+        "Releasing {} pinned session(s) idle for over {} minutes",
+        expired.len(),
+        MAX_IDLE.as_secs() / 60
+    );
     for client in expired {
         rollback_and_release(client).await;
     }
-
-    taken
 }
 
 /// Pin `client` to `session_id` until the session ends its transaction.
