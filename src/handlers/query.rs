@@ -146,16 +146,8 @@ async fn run_batch_in_session(
         let outcome = exec_query_on_client(&pg_client, query, limit, page).await;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        // A failed statement changes nothing: a failed COMMIT leaves the
-        // transaction open (aborted), and the session stays pinned so the
-        // user can still ROLLBACK from the same tab.
-        if outcome.is_ok() {
-            match transaction_effect(query) {
-                TransactionEffect::Opens => in_transaction = true,
-                TransactionEffect::Closes => in_transaction = false,
-                TransactionEffect::None => {}
-            }
-        }
+        in_transaction =
+            transaction_effect(query).in_transaction_after(outcome.is_ok(), in_transaction);
 
         match outcome {
             Ok(result) => results.push(json!({
@@ -412,8 +404,22 @@ pub enum TransactionEffect {
     /// `ROLLBACK TO SAVEPOINT` does not close it and is classified as
     /// [`TransactionEffect::None`].
     Closes,
+    /// Ends the current transaction and opens a new one (`COMMIT AND CHAIN`).
+    Chains,
     /// Leaves the transaction state as it was.
     None,
+}
+
+impl TransactionEffect {
+    /// Whether a transaction is open after a statement with this effect ran.
+    pub fn in_transaction_after(self, succeeded: bool, before: bool) -> bool {
+        match (self, succeeded) {
+            (TransactionEffect::Opens, true) => true,
+            // PostgreSQL ends the transaction even when COMMIT itself fails, e.g. on a deferred constraint.
+            (TransactionEffect::Closes, _) | (TransactionEffect::Chains, false) => false,
+            _ => before,
+        }
+    }
 }
 
 /// Classify a statement's effect on the transaction state.
@@ -424,23 +430,28 @@ pub enum TransactionEffect {
 /// or `CREATE FUNCTION` statement, whose leading keyword is neither.
 pub fn transaction_effect(query: &str) -> TransactionEffect {
     let normalized = strip_leading_sql_comments(query);
-    let mut words = normalized
+    // Five words cover the longest form, `COMMIT TRANSACTION AND NO CHAIN`.
+    let words: Vec<String> = normalized
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .filter(|w| !w.is_empty())
-        .map(|w| w.to_uppercase());
+        .take(5)
+        .map(|w| w.to_uppercase())
+        .collect();
+    let second = words.get(1).map(String::as_str);
+    let chains = words.windows(2).any(|p| p[0] == "AND" && p[1] == "CHAIN");
 
-    let Some(first) = words.next() else {
-        return TransactionEffect::None;
-    };
-    let second = words.next();
-
-    match first.as_str() {
-        "BEGIN" => TransactionEffect::Opens,
-        "START" if second.as_deref() == Some("TRANSACTION") => TransactionEffect::Opens,
-        "COMMIT" => TransactionEffect::Closes,
-        "ROLLBACK" if second.as_deref() == Some("TO") => TransactionEffect::None,
-        "ROLLBACK" => TransactionEffect::Closes,
-        "END" => TransactionEffect::Closes,
+    match words.first().map(String::as_str) {
+        // `BEGIN` alone, `BEGIN TRANSACTION`, `BEGIN ISOLATION LEVEL …`.
+        Some("BEGIN") => TransactionEffect::Opens,
+        Some("START") if second == Some("TRANSACTION") => TransactionEffect::Opens,
+        // Two-phase commit acts on a prepared transaction, not this session's.
+        Some("COMMIT" | "ROLLBACK") if second == Some("PREPARED") => TransactionEffect::None,
+        // `ROLLBACK TO [SAVEPOINT] x` unwinds to a savepoint and leaves the transaction open.
+        Some("ROLLBACK") if second == Some("TO") => TransactionEffect::None,
+        Some("COMMIT" | "END" | "ROLLBACK" | "ABORT") if chains => TransactionEffect::Chains,
+        Some("COMMIT" | "END" | "ROLLBACK" | "ABORT") => TransactionEffect::Closes,
+        // `PREPARE TRANSACTION` dissociates the transaction from the session.
+        Some("PREPARE") if second == Some("TRANSACTION") => TransactionEffect::Closes,
         _ => TransactionEffect::None,
     }
 }
